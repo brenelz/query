@@ -3,8 +3,8 @@
 // why that happens.
 import { notifyManager, shouldThrowError } from '@tanstack/query-core'
 import {
-  NotReadyError,
   createRenderEffect,
+  flush,
   createSignal,
   createStore,
   getObserver,
@@ -13,6 +13,7 @@ import {
   reconcile,
   refresh,
   runWithOwner,
+  sharedConfig,
   snapshot,
   untrack,
   useContext,
@@ -190,6 +191,13 @@ export function useBaseQuery<
   // Apply options in an effect to avoid store writes inside the memo.
   // setOptions triggers updateResult → notify → subscription → setState,
   // which must run in an effect context in Solid v2.
+  //
+  // The suspense gate below also applies options, during propagation —
+  // needed because this effect's commit is deferred while suspended reads
+  // keep the subtree pending. The shared `appliedOptions` marker keeps the
+  // two from double-applying, and the stale-flush guard keeps a deferred
+  // commit of this effect (which can carry a superseded value after the
+  // subtree settles) from flipping the observer back to the old query.
   createRenderEffect(
     () => trackedDefaultedOptions(),
     (opts) => {
@@ -329,6 +337,74 @@ export function useBaseQuery<
     This resolver will be called when the observer is unmounting
     but the resource is still in a loading state
   */
+  /**
+   * Client-side suspense gate for non-nullable `data` reads. While the
+   * current query is loading, the gate's value is a live thenable that
+   * settles exactly when the query's fetch does. Reading the gate from a
+   * tracking scope while that promise is pending throws a properly-sourced
+   * NotReadyError (the runtime attaches this node as the not-ready
+   * source), parking the reader until the fetch lands; the settle then
+   * wakes the parked readers, which re-read the store once the deferred
+   * options effect has synced it. Once settled (or when nothing is
+   * loading) the gate yields nothing and reads fall through to the store.
+   */
+  const [suspenseGate] = createSignal<unknown>(() => {
+    const opts = trackedDefaultedOptions()
+    if (isServer) return undefined
+    const result = untrack(() => observer.getOptimisticResult(opts))
+    if (!result.isLoading) return undefined
+    // A live thenable that settles when the query for these options
+    // settles, watched through the query cache — agnostic to who runs the
+    // fetch (the observer's option-change fetch in the render effect, a
+    // router loader's prefetch, or the gate's own kick below). The gate
+    // starts a fetch itself only when nobody else has after a microtask:
+    // in normal flows the render effect's setOptions triggers the fetch
+    // synchronously within the flush, but while suspended reads keep this
+    // subtree pending Solid defers that effect's commit — precisely the
+    // case where the fetch must be kicked from here (via the observer's
+    // optimistic-fetch path, carrying the observer's behavior so infinite
+    // queries fetch page-shaped data). It never rejects — errors surface
+    // through the query state (and throwOnError), not through the gate.
+    return new Promise<void>((resolve) => {
+      const queryCache = untrack(() => client().getQueryCache())
+      const queryHash = opts.queryHash as string
+      let done = false
+      const finish = () => {
+        if (done) return
+        done = true
+        unsubscribeGate()
+        resolve()
+      }
+      const isSettled = () => {
+        const query = queryCache.get(queryHash)
+        return query !== undefined && query.state.status !== 'pending'
+      }
+      const unsubscribeGate = queryCache.subscribe(() => {
+        if (isSettled()) finish()
+      })
+      onCleanup(finish)
+      queueMicrotask(() => {
+        if (done) return
+        // Give a *scheduled* options render effect its chance to commit and
+        // start the fetch first — flush() runs scheduled work but leaves
+        // commits deferred by a pending subtree alone, which is exactly
+        // the case the kick below exists for.
+        flush()
+        if (done) return
+        if (isSettled()) return finish()
+        const query = queryCache.get(queryHash)
+        if (!query || query.state.fetchStatus === 'idle') {
+          const behavior = untrack(() => observer.options as any)?.behavior
+          void untrack(() =>
+            observer.fetchOptimistic(
+              behavior ? ({ ...opts, behavior } as typeof opts) : opts,
+            ),
+          ).catch(() => {})
+        }
+      })
+    })
+  })
+
   let resolver: ((value: ResourceData) => void) | null = null
   // Use createSignal(fn) instead of createMemo so the derived memo has
   // _preventAutoDisposal set. Without it, a createMemo that no one reads
@@ -503,11 +579,14 @@ export function useBaseQuery<
       }
 
       // `data` is typed non-nullable, so a read that happens before the first
-      // fetch settles has no value to return. Suspend instead: throwing
-      // NotReadyError from a tracking scope sends the reader to the nearest
-      // <Loading> boundary, mirroring the isServer branch above so both sides
-      // behave the same. The `state` reads here are what re-subscribe the
-      // reader, so it re-runs once the subscriber syncs the settled result.
+      // fetch settles has no value to return. Suspend instead, by reading
+      // the pending query resource: the read throws a properly-sourced
+      // NotReadyError (the runtime attaches the resource memo as the
+      // not-ready source, which is what boundaries and the settle sweep
+      // track — a hand-thrown NotReadyError carrying a non-reactive source
+      // corrupts that tracking). It mirrors the isServer branch above so
+      // both sides behave the same, and falls through when the resource
+      // settled between the store update and this read.
       //
       // Only `isLoading` suspends (pending *and* fetching). A query that is
       // pending but idle — disabled, or reset with no observer fetching — has
@@ -517,8 +596,33 @@ export function useBaseQuery<
       // Untracked reads pass through: event handlers and effect callbacks
       // peek at the raw value, which keeps imperative access working (and
       // lets callers observe pending states) without suspending.
-      if (prop === 'data' && getObserver() && state.isLoading) {
-        throw new NotReadyError(observer.getCurrentQuery())
+      //
+      // Hydration stands down: while Solid is claiming server-rendered DOM
+      // (`sharedConfig.hydrating`), a suspension here would bail the claim
+      // — the server rendered this content from settled data the streaming
+      // channel has not yet primed on the client — leaving unclaimed nodes
+      // and an unsettleable boundary. Reads during that window return the
+      // store value, exactly as before data became non-nullable.
+      if (
+        prop === 'data' &&
+        getObserver() &&
+        state.status === 'pending' &&
+        !sharedConfig.hydrating
+      ) {
+        suspenseGate()
+        // The gate has settled but the subscriber may not have synced the
+        // store yet (the gate's fetch promise can resolve ahead of the
+        // observer notification). Serve this read from the observer's
+        // fresh result; the store sync follows and re-renders. The store
+        // reads above keep this reader subscribed either way.
+        const fresh = untrack(() =>
+          observer.getOptimisticResult(
+            untrack(() => trackedDefaultedOptions()),
+          ),
+        )
+        if (fresh.status !== 'pending') {
+          return Reflect.get(fresh, prop)
+        }
       }
 
       return Reflect.get(target, prop, receiver)

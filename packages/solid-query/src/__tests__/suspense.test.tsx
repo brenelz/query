@@ -88,14 +88,21 @@ describe("useQuery's in Loading mode", () => {
 
     function Page() {
       const [multiplier, setMultiplier] = createSignal(1)
-      const state = useInfiniteQuery(() => ({
-        queryKey: [`${key}_${multiplier()}`],
-        queryFn: ({ pageParam }) =>
-          sleep(10).then(() => pageParam * multiplier()),
-        initialPageParam: 1,
-        suspense: true,
-        getNextPageParam: (lastPage) => lastPage + 1,
-      }))
+      // Capture reactive inputs at options-compute time (inside the
+      // propagation): with suspended reads holding the transition pending,
+      // a live `multiplier()` read at queryFn-resolution time would see
+      // the committed pre-transition value.
+      const state = useInfiniteQuery(() => {
+        const currentMultiplier = multiplier()
+        return {
+          queryKey: [`${key}_${currentMultiplier}`],
+          queryFn: ({ pageParam }) =>
+            sleep(10).then(() => pageParam * currentMultiplier),
+          initialPageParam: 1,
+          suspense: true,
+          getNextPageParam: (lastPage) => lastPage + 1,
+        }
+      })
 
       createRenderEffect(
         () => deep(state),
@@ -385,7 +392,10 @@ describe("useQuery's in Loading mode", () => {
     function Component(props: { queryKey: Array<string> }) {
       const result = useQuery(() => ({
         queryKey: props.queryKey,
-        queryFn: () => sleep(100).then(() => props.queryKey),
+        // Read the key from the fetch context, not the reactive prop: at
+        // resolution time a held transition still serves the previous
+        // committed prop value to outside readers.
+        queryFn: (context) => sleep(100).then(() => context.queryKey),
         retry: false,
         suspense: true,
       }))
